@@ -1,0 +1,37 @@
+{
+  "name": "nextguard-strapi-plugin",
+  "version": "1.0.0",
+  "description": "NextGuard CVE monitoring plugin for Strapi 5",
+  "license": "MIT",
+  "strapi": {
+    "kind"       : "plugin",
+    "name"       : "nextguard",
+    "displayName": "NextGuard",
+    "description": "Continuous CVE monitoring for your Strapi 5 packages"
+  },
+  "main"  : "./dist/strapi-server.js",
+  "module": "./dist/strapi-admin.js",
+  "types" : "./dist/strapi-server.d.ts",
+  "exports": {
+    "./strapi-server": "./dist/strapi-server.js",
+    "./strapi-admin" : "./dist/strapi-admin.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "peerDependencies": {
+    "@strapi/strapi": "^5.0.0",
+    "react"         : "^18.0.0"
+  },
+  "devDependencies": {
+    "@strapi/strapi"        : "^5.0.0",
+    "@strapi/admin"         : "^5.0.0",
+    "@strapi/design-system" : "^2.0.0",
+    "react"                 : "^18.0.0",
+    "typescript"            : "^5.0.0",
+    "@types/react"          : "^18.0.0",
+    "@types/node"           : "^20.0.0"
+  },
+  "keywords": ["strapi", "strapi-plugin", "strapi5", "nextguard", "security", "cve"]
+}
