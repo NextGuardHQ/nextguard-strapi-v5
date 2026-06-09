@@ -3,22 +3,36 @@ import type { Core } from '@strapi/strapi';
 const settings = ({ strapi }: { strapi: Core.Strapi }) => ({
 
   async getSettings(ctx: any) {
-    const svc = strapi.plugin('nextguard').service<any>('nextguard');
-    const cfg = await svc.getConfig();
+    const svc     = strapi.plugin('nextguard').service<any>('nextguard');
+    const cfg     = await svc.getConfig();
+    const preview = await svc.getPreview();
     ctx.body = {
-      connected  : !!(cfg.token && cfg.projectId),
-      projectId  : cfg.projectId,
-      projectName: cfg.projectName,
-      lastSync   : cfg.lastSync,
+      connected     : !!(cfg.token && cfg.projectId),
+      isAnon        : preview.isAnon,
+      projectId     : cfg.projectId,
+      projectName   : cfg.projectName,
+      lastSync      : cfg.lastSync,
+      preview       : preview.preview,
+      registerUrl   : preview.registerUrl,
+      syncsRemaining: preview.syncsRemaining,
+      lastScan      : preview.lastScan,
     };
+  },
+
+  async getPlans(ctx: any) {
+    const svc    = strapi.plugin('nextguard').service<any>('nextguard');
+    const locale = (ctx.query?.locale as string) || 'en';
+    ctx.body = { plans: await svc.getPlans(locale) };
   },
 
   async requestCode(ctx: any) {
     const { apiKey } = ctx.request.body as { apiKey?: string };
-    if (!apiKey?.trim()) return ctx.badRequest('API key is required');
+    const key = apiKey?.trim();
+    if (!key) return ctx.badRequest('API key is required');
+    if (!key.startsWith('vs_pk_')) return ctx.badRequest('Invalid API key. Keys must start with vs_pk_');
     try {
       const svc  = strapi.plugin('nextguard').service<any>('nextguard');
-      ctx.body   = await svc.requestActivationCode(apiKey.trim());
+      ctx.body   = await svc.requestActivationCode(key);
     } catch (err: any) {
       return ctx.badRequest(err.message);
     }

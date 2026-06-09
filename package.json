@@ -1,6 +1,6 @@
 {
   "name": "nextguard-strapi-plugin",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "NextGuard CVE monitoring plugin for Strapi 5",
   "license": "MIT",
   "strapi": {

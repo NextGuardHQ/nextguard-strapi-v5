@@ -8,6 +8,48 @@ import type { Core } from '@strapi/strapi';
 const HOST          = process.env.NEXTGUARD_HOST ?? 'https://nextguardhq.com';
 const SYNC_PATH     = '/api/v1/cms/sync';
 const ACTIVATE_PATH = '/api/v1/auth/activate';
+const PLANS_PATH    = '/api/public/plans';
+
+// ─── Public types ───────────────────────────────────────────────────────────
+
+export interface Plan {
+  key         : string;
+  name        : string;
+  priceDisplay: string;
+  period      : string;
+  cta         : string;
+  highlighted : boolean;
+  features    : string[];
+  href        : string;
+}
+
+export interface PreviewVuln {
+  severity        : string;
+  componentName   : string;
+  installedVersion: string;
+  title           : string;
+  fixedIn         : string;
+  cveId           : string;
+}
+
+export interface PreviewSummary {
+  total   : number;
+  critical: number;
+  high    : number;
+  medium  : number;
+  low     : number;
+}
+
+export interface Preview {
+  available: boolean;
+  summary  : PreviewSummary;
+  shown    : PreviewVuln[];
+  hidden   : number;
+}
+
+// Anonymous Live Scan keys bind to an ephemeral project server-side, so they
+// skip the device-authorization flow and sync immediately.
+const isAnonKey = (key: string) => key.startsWith('vs_pk_anon_');
 
 // ─── HTTP helper ──────────────────────────────────────────────────────────────
 
@@ -125,30 +167,95 @@ const nextguardService = ({ strapi }: { strapi: Core.Strapi }) => ({
       projectId  : await storeGet(strapi, 'projectId'),
       projectName: await storeGet(strapi, 'projectName'),
       token      : await storeGet(strapi, 'token'),
+      apiKey     : await storeGet(strapi, 'apiKey'),
       lastSync   : await storeGet(strapi, 'lastSync'),
     };
   },
 
-  async saveConfig({ projectId, projectName, token }: {
+  async saveConfig({ projectId, projectName, token, apiKey }: {
     projectId?: string | null;
     projectName?: string | null;
     token?: string | null;
+    apiKey?: string | null;
   }) {
     if (projectId   !== undefined) await storeSet(strapi, 'projectId',   projectId);
     if (projectName !== undefined) await storeSet(strapi, 'projectName', projectName);
     if (token       !== undefined) await storeSet(strapi, 'token',       token);
+    if (apiKey      !== undefined) await storeSet(strapi, 'apiKey',      apiKey);
   },
 
   async disconnect() {
-    for (const key of ['projectId', 'projectName', 'token', 'lastSync']) {
+    for (const key of [
+      'projectId', 'projectName', 'token', 'apiKey', 'lastSync',
+      'lastPreview', 'registerUrl', 'syncsRemaining', 'lastScan', 'isAnon',
+    ]) {
       await storeSet(strapi, key, null);
     }
   },
 
+  // ─── Last scan / teaser preview ──────────────────────────────────────────
+
+  async getPreview(): Promise<{
+    preview       : Preview | null;
+    registerUrl   : string;
+    syncsRemaining: number | null;
+    lastScan      : string | null;
+    isAnon        : boolean;
+  }> {
+    const raw = await storeGet(strapi, 'lastPreview');
+    let preview: Preview | null = null;
+    if (raw) { try { preview = JSON.parse(raw) as Preview; } catch { preview = null; } }
+
+    const syncsRaw = await storeGet(strapi, 'syncsRemaining');
+
+    return {
+      preview,
+      registerUrl   : (await storeGet(strapi, 'registerUrl')) ?? `${HOST}/register`,
+      syncsRemaining: syncsRaw != null ? Number(syncsRaw) : null,
+      lastScan      : await storeGet(strapi, 'lastScan'),
+      isAnon        : (await storeGet(strapi, 'isAnon')) === '1',
+    };
+  },
+
+  // ─── Live plans (cached 1h, static fallback) ─────────────────────────────
+
+  async getPlans(locale = 'en'): Promise<Plan[]> {
+    const cacheKey  = `plans_${locale}`;
+    const cachedRaw = await storeGet(strapi, cacheKey);
+    const cachedAt  = await storeGet(strapi, `${cacheKey}_at`);
+    if (cachedRaw && cachedAt && Date.now() - Number(cachedAt) < 3_600_000) {
+      try { return JSON.parse(cachedRaw) as Plan[]; } catch { /* fall through */ }
+    }
+
+    try {
+      const url = `${HOST}${PLANS_PATH}?keys=free,monitoring,starter&locale=${encodeURIComponent(locale)}`;
+      const res = await request('GET', url, { 'ngrok-skip-browser-warning': '1' }, null);
+      if (res.status === 200 && Array.isArray(res.body?.plans) && res.body.plans.length) {
+        const plans = res.body.plans as Plan[];
+        await storeSet(strapi, cacheKey, JSON.stringify(plans));
+        await storeSet(strapi, `${cacheKey}_at`, String(Date.now()));
+        return plans;
+      }
+    } catch (err: any) {
+      strapi.log.warn('[nextguard] Plans fetch failed: ' + err.message);
+    }
+
+    return staticPlans();
+  },
+
   async requestActivationCode(apiKey: string) {
+    // Anonymous keys skip device-auth: persist the key, sync immediately and
+    // capture the teaser preview the server returns.
+    if (isAnonKey(apiKey)) {
+      await this.saveConfig({ apiKey });
+      await storeSet(strapi, 'isAnon', '1');
+      await this.sync();
+      return { anon: true as const };
+    }
+
     const res = await request('POST', `${HOST}${ACTIVATE_PATH}`, { 'X-API-Key': apiKey }, '{}');
     if (res.status !== 200) throw new Error(res.body?.error ?? 'Could not request activation code');
-    return res.body as { code: string; expiresIn: number };
+    return { ...(res.body as { code: string; expiresIn: number }), anon: false as const };
   },
 
   async pollActivationStatus(code: string, apiKey: string) {
@@ -165,11 +272,17 @@ const nextguardService = ({ strapi }: { strapi: Core.Strapi }) => ({
 
   async sync() {
     const cfg = await this.getConfig();
-    if (!cfg.token || !cfg.projectId) throw new Error('NextGuard: not configured');
+    // Effective signing/auth key: device token if present, else stored api key.
+    const authKey = cfg.token || cfg.apiKey || '';
+    const anon    = !!authKey && isAnonKey(authKey);
+
+    // Anonymous keys bind to an ephemeral project server-side, so no projectId
+    // is required. Account keys require both a device token and a projectId.
+    if (!authKey || (!cfg.projectId && !anon)) throw new Error('NextGuard: not configured');
 
     const appRoot = (strapi as any).dirs?.app?.root ?? process.cwd();
     const payload = {
-      projectId  : cfg.projectId,
+      ...(cfg.projectId ? { projectId: cfg.projectId } : {}),
       cmsType    : 'strapi',
       cmsVersion : installedVersion(appRoot, '@strapi/strapi') ?? installedVersion(appRoot, 'strapi') ?? 'unknown',
       nodeVersion: process.version.replace('v', ''),
@@ -178,24 +291,72 @@ const nextguardService = ({ strapi }: { strapi: Core.Strapi }) => ({
     };
 
     const bodyStr = JSON.stringify(payload);
-    const headers = buildHeaders('POST', SYNC_PATH, bodyStr, cfg.token);
+    const headers = buildHeaders('POST', SYNC_PATH, bodyStr, authKey);
     const res     = await request('POST', `${HOST}${SYNC_PATH}`, headers, bodyStr);
 
     if (res.status === 200) {
       await storeSet(strapi, 'lastSync', new Date().toISOString());
+
+      // Capture the teaser preview the server returns so the admin can render
+      // the vulnerability table + register CTA right here.
+      const data = res.body;
+      if (data && typeof data === 'object' && data.preview) {
+        await storeSet(strapi, 'lastPreview', JSON.stringify(data.preview));
+        await storeSet(strapi, 'registerUrl', data.registerUrl ?? `${HOST}/register`);
+        await storeSet(strapi, 'syncsRemaining',
+          data.syncsRemaining != null ? String(data.syncsRemaining) : null);
+        await storeSet(strapi, 'lastScan', data.scannedAt || new Date().toISOString());
+      }
     }
 
-    return { success: res.status === 200, components: payload.components.length };
+    return { success: res.status === 200, components: payload.components.length, anon };
   },
 
   async syncIfConfigured() {
     try {
-      const cfg = await this.getConfig();
-      if (cfg.token && cfg.projectId) await this.sync();
+      const cfg     = await this.getConfig();
+      const authKey = cfg.token || cfg.apiKey || '';
+      const anon    = !!authKey && isAnonKey(authKey);
+      if (authKey && (cfg.projectId || anon)) await this.sync();
     } catch (err: any) {
       strapi.log.warn('[nextguard] Sync failed:', err.message);
     }
   },
 });
+
+// ─── Static plans fallback (mirrors the website pricing) ─────────────────────
+
+function staticPlans(): Plan[] {
+  const base = HOST.replace(/\/$/, '');
+  return [
+    {
+      key: 'free', name: 'Free', priceDisplay: '$0', period: '',
+      href: `${base}/register`, cta: 'Create free account', highlighted: false,
+      features: [
+        'Full vulnerability report (no blur)',
+        '1 monitored project',
+        'CVE database access',
+      ],
+    },
+    {
+      key: 'monitoring', name: 'Monitoring', priceDisplay: '$3', period: '/mo',
+      href: `${base}/checkout/monitoring`, cta: 'Get Monitoring', highlighted: true,
+      features: [
+        'Continuous automatic re-scans',
+        'Email alerts on new CVEs',
+        'Unlimited scans, no expiry',
+      ],
+    },
+    {
+      key: 'starter', name: 'Starter', priceDisplay: '$7', period: '/mo',
+      href: `${base}/checkout/starter`, cta: 'Get Starter', highlighted: false,
+      features: [
+        'Everything in Monitoring',
+        'Multiple projects & environments',
+        'Scan history & auto-patching',
+      ],
+    },
+  ];
+}
 
 export default nextguardService;
